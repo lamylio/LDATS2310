@@ -4,3 +4,5 @@
 Projet.Rproj
 *.Rproj
 *.Rproj.*
+
+.Rproj.user/*
