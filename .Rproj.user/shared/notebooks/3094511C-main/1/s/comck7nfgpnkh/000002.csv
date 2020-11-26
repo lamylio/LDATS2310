@@ -1,0 +1,4 @@
+"0","models.comparison = addComparison(model.nb.1, ""GLM NB 1"")
+"
+"2","Error in log(y) : non-numeric argument to mathematical function
+"

@@ -1,0 +1,12 @@
+"0","# Factors are ordered
+model.tree.1 = rpart(
+  cbind(Exposure, Nbclaims) ~ Gender + DriverAge + CarAge + Power + Area + Fract + Leasing, 
+  data=base_train_ordered,
+  method = ""poisson"",
+  parms = list(shrink=4), # Method is deviance
+  control = rpart.control(cp = 0.005, xval = 10, maxdepth = 50)
+)
+"
+"2","Error in rpart.control(cp = 0.005, xval = 10, maxdepth = 50) : 
+  La profondeur maximale est de 30
+"
