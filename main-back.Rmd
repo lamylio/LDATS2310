@@ -1,15 +1,11 @@
 ---
-title: "Main"
+title: "LDATS2310 - Individual project"
 author: "Lamy Lionel"
-date: "10/11/2020"
-output: pdf_document
+date: "30/11/2020"
 ---
+# Not made to knit
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
-# Load all the libraries in one-shot
+# Load all possible used libraries in one-shot
 
 ```{r message=F, warning=F}
 set.seed(112020)
@@ -61,7 +57,7 @@ base_test = within(base_test, {
   Fract = factor(Fract, labels=c("Monthly", "Quarterly", "Yearly"))
 })
 
-# As there isn't any Exposure equal to zero, we can compute the real frequencies
+# As there is no Exposure equal to zero, we can compute the real frequencies
 base_train_freq = base_train
 base_train_freq$Frequency = base_train$Nbclaims / base_train$Exposure
 ```
@@ -156,6 +152,7 @@ addComparison = function(model, model_name){
 
 # Generalized Linear Models
 ## In the paper I only talked about naive but have experimented many more models
+## In fact, I spent too much time experimenting with those..
 
 ```{r}
 # Naive
@@ -332,7 +329,7 @@ model.tree.4.predicted = (function(M = 20){
 ```
 
 # Random Forest
-# As in the examples given
+# As in the examples given (haven't talked about this in the report due to a lack of time)
 ```{r}
 
 model.forest.1 = (function(M=100, C=3){
@@ -414,7 +411,6 @@ plot(model.rfCount)
 ```
 
 
-
 # Gradient boosting model
 
 ```{r}
@@ -422,30 +418,21 @@ model.gbm.1 = gbm(formule.long.offset, data=base_train, distribution = "poisson"
 
 model.gbm.2 = gbm(formule.long.offset, data=base_train, distribution = "poisson", shrinkage = 0.001, n.trees = 5000, n.cores = 4, cv.folds = 3, train.fraction = 0.75) # without weights 
 
-gbm.best.oob = gbm.perf(model.gbm.2, method = "OOB")
-gbm.best.cv = gbm.perf(model.gbm.2, method = "cv")
-gbm.best.test = gbm.perf(model.gbm.2, method = "test")
+model.gbm.3 = gbm(formule.long.offset, data=base_train, distribution = "poisson", shrinkage = 0.01, n.trees = 5000, n.cores = 4, cv.folds = 3, train.fraction = 0.75)
+
+gbm.best.oob = gbm.perf(model.gbm.3, method = "OOB")
+gbm.best.cv = gbm.perf(model.gbm.3, method = "cv")
+gbm.best.test = gbm.perf(model.gbm.3, method = "test")
 
 par(mfrow=c(2,2))
-plot(model.gbm.2, i.var = 1)
-plot(model.gbm.2, i.var = 2)
-plot(model.gbm.2, i.var = 3)
-plot(model.gbm.2, i.var = 4)
 
-install.packages('dismo')
-library(dismo)
-brtTuning<- gbm.step(data=base_train,
-   gbm.x = 1:8,
-   gbm.y = 10,
-   family = "poisson",
-   tree.complexity = 4,
-   learning.rate = 0.001,
-   bag.fraction = 0.75)
+
+gbm.plot.fits(model.gbm.3)
 
 ```
 
 # Neural Network
-
+# Using tuned neuralnet
 ```{r}
 #library(neuralnet)
 
@@ -456,7 +443,7 @@ source(file="./NN/DHcompute.r")
 source(file="./NN/DHgwplot.r")
 
 
-# Scale the cat.var
+# Scale the cat.var for training
 scaled_driver = (base_train$DriverAge-min(base_train$DriverAge))/(max(base_train$DriverAge)-min(base_train$DriverAge))
 scaled_car = (base_train$CarAge-min(base_train$CarAge))/(max(base_train$CarAge)-min(base_train$CarAge))
 
@@ -464,18 +451,27 @@ neural_dummies = model.matrix(~ Gender+Power+Area+Fract+Leasing+Contract, data=b
 
 neural_train = data.frame(DriverAge=scaled_driver, CarAge=scaled_car, neural_dummies, Nbclaims=base_train$Nbclaims, Exposure=base_train_freq$Exposure, Frequency=base_train_freq$Frequency)
 
+# same for test
+scaled_driver_t = (base_test$DriverAge-min(base_test$DriverAge))/(max(base_test$DriverAge)-min(base_test$DriverAge))
+scaled_car_t = (base_test$CarAge-min(base_test$CarAge))/(max(base_test$CarAge)-min(base_test$CarAge))
+
+neural_dummies_t = model.matrix(~ Gender+Power+Area+Fract+Leasing+Contract, data=base_test)[,-1]
+
+neural_test = data.frame(DriverAge=scaled_driver_t, CarAge=scaled_car_t, neural_dummies_t)
+
 # Split the data to control overfitting
 
 nr      = nrow(neural_train)
-sizecal = round(0.80*nr)
+sizecal = round(0.85*nr)
 
 tmp     =sample( nr, sizecal , replace = FALSE, prob = NULL)
 neural_calib = neural_train[tmp,]
 neural_valid = neural_train[-tmp,]
 
+# Use all the covariates available
 formule.neural = as.formula(paste0("Frequency ~ ", paste(colnames(neural_train)[1:14], collapse = " + ")))
 
-model.neural.1 = neuralnet(formule.neural, data=neural_train, hidden=5, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson")
+model.neural.1 = neuralnet(formule.neural, data=neural_train, hidden = 4, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep=3, lear)
 
 # Get covariates easily
 covariates.neural = function(base){
@@ -490,10 +486,15 @@ covariates.neural = function(base){
   return (cov)
 }
 
+# Sorry, the code below is a mess
 
-neural.calib.1 = neuralnet(formule.neural, data=neural_calib, hidden=1, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep = 5)
-neural.calib.2 = neuralnet(formule.neural, data=neural_calib, hidden=2, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep = 5)
-neural.calib.3 = neuralnet(formule.neural, data=neural_calib, hidden=3, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep = 5)
+
+neural.calib.1 = neuralnet(formule.neural, data=neural_calib, hidden=1, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep = 3)
+neural.calib.2 = neuralnet(formule.neural, data=neural_calib, hidden=2, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep = 3)
+neural.calib.3 = neuralnet(formule.neural, data=neural_calib, hidden=3, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep = 3)
+neural.calib.4 = neuralnet(formule.neural, data=neural_calib, hidden=4, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep = 3)
+
+neural.calib.x = neuralnet(formule.neural, data=neural_calib, hidden=18, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson") # overkill just to test
 
 model.neural.calib = c(
   neural.calib.1$result.matrix[1],
@@ -501,32 +502,33 @@ model.neural.calib = c(
   neural.calib.3$result.matrix[1]
 )
 
-neural.valid.1 = compute(neural.calib.1, covariates.neural(neural_valid), 50, neural_valid$Frequency, neural_valid$Exposure) 
+neural.valid.1 = compute(neural.calib.1, covariates.neural(neural_train), 50, neural_train$Frequency, neural_train$Exposure) 
 
-neural.valid.2 = compute(neural.calib.2, covariates.neural(neural_valid), 50, neural_valid$Frequency, neural_valid$Exposure) 
+neural.valid.2 = compute(neural.calib.2, covariates.neural(neural_train), 50, neural_train$Frequency, neural_train$Exposure) 
 
-neural.valid.3 = compute(neural.calib.3, covariates.neural(neural_valid), 50, neural_valid$Frequency, neural_valid$Exposure)
+neural.valid.3 = compute(neural.calib.3, covariates.neural(neural_train), 50, neural_train$Frequency, neural_train$Exposure)
 
 
 model.neural.valid = c(
   neural.valid.1$devstat,
   neural.valid.2$devstat,
-  neural.valid.3$devstat
+  neural.valid.3$devstat,
+  compute(neural.calib.10, covariates.neural(neural_train), 50, neural_train$Frequency, neural_train$Exposure)$devstat
 )
 
-ggplot() + aes(x=3:6)+ geom_line(aes(y=model.neural.valid, col="red"))
+ggplot() + aes(x=1:4)+ geom_line(aes(y=model.neural.valid, col="red"))
+
+ggplot(neural_train) + aes(1:70000) + geom_point(aes(y=Frequency, color=2)) + geom_point(aes(y=compute(model.neural.1, covariates.neural(neural_train), 50, neural_train$Frequency, neural_train$Exposure)$net.result))
 
 ```
 
 
 # --- END ---
 
-# MOB Random forest
+# MOB Random forest ?
 
 ```{r}
 library(mobForest)
 
-
 model.mob = mobforest.analysis(formule.long.offset, data=base_train, family = poisson(), partition_vars = formule.covariates)
-
 ```
