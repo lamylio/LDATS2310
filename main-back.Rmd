@@ -256,11 +256,10 @@ model.gam.1 = gam(
     Nbclaims ~ s(DriverAge, bs ="cr", k=5) + s(CarAge,bs ="cr", k= 3) + Power+Gender+Area+Leasing+Fract,
     data = base_train, 
     family=poisson(link = "log"),
-    offset = log(Exposure),
-    method = "ML"
+    offset = log(Exposure)
 )
 
-model.gam.1.predicted = predict(model.gam.1, type="response")
+model.gam.1.predicted = predict(model.gam.1, base_test, type="response")
 # model.gam.2.predicted = predict(model.gam.2, type="response")
 # model.gam.3.predicted = predict(model.gam.3, type="response")
 # model.gam.4.predicted = predict(model.gam.4, type="response")
@@ -301,7 +300,7 @@ model.tree.3 = rpart(
 
 rpart.plot(model.tree.1, digits=2, type=4)
 
-model.tree.3.predicted = exp(predict(model.tree.1, base_test))
+model.tree.3.predicted = predict(model.tree.3, base_test)
 
 # Bagging
 model.tree.4.predicted = (function(M = 20){
@@ -389,11 +388,18 @@ model.forest.2 = (function(M=100, C=3){
 # Random Forest with rfCountData from github
 
 ```{r}
-rfPoisson_train = within(neural_train, {
+library(rfCountData)
+rfPoisson_train = within(base_train, {
     
   Nbclaims = NULL
   Exposure = NULL
   Frequency = NULL
+  
+})
+
+rfPoisson_test = within(base_test, {
+    
+  Exposure = NULL
   
 })
 nr      = nrow(rfPoisson_train)
@@ -403,11 +409,13 @@ tmp     =sample( nr, sizecal , replace = FALSE, prob = NULL)
 rfPoisson_calib = rfPoisson_train[tmp,]
 rfPoisson_valid = rfPoisson_train[-tmp,]
 
-model.rfCount = rfPoisson(x = rfPoisson_train, y=base_train$Nbclaims, offset = log(base_train$Exposure), ntree=300, do.trace=T, replace = T, sampsize = 0.85*70000)
+model.rfCount = rfPoisson(x = rfPoisson_train, y=base_train$Nbclaims, offset = log(base_train$Exposure), ntree=100, do.trace=T, replace = T)
 
 model.rfCount.cv = rfcv(trainx = rfPoisson_calib, trainy = base_train[tmp,]$Nbclaims, offset(log(base_train[tmp,]$Exposure)))
 
 plot(model.rfCount)
+
+model.rfCount.predicted = predict(model.rfCount, rfPoisson_test, offset=log(base_test$Exposure), type="response")
 ```
 
 
@@ -426,7 +434,7 @@ gbm.best.test = gbm.perf(model.gbm.3, method = "test")
 
 par(mfrow=c(2,2))
 
-
+model.gbm.3.predicted = predict(model.gbm.3, base_test, type="response")
 gbm.plot.fits(model.gbm.3)
 
 ```
@@ -471,7 +479,10 @@ neural_valid = neural_train[-tmp,]
 # Use all the covariates available
 formule.neural = as.formula(paste0("Frequency ~ ", paste(colnames(neural_train)[1:14], collapse = " + ")))
 
-model.neural.1 = neuralnet(formule.neural, data=neural_train, hidden = 4, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep=3, lear)
+model.neural.1 = neuralnet(formule.neural, data=neural_train, hidden = 4, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep=3)
+
+model.neural.1.predicted = compute(model.neural.1, neural_test)
+model.neural.1.predicted.package = predict(model.neural.1, neural_test, type="response")
 
 # Get covariates easily
 covariates.neural = function(base){
