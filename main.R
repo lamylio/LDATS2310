@@ -8,28 +8,32 @@ output: pdf_document
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
+
+# Load all the libraries in one-shot
+
 ```{r message=F, warning=F}
-library(MASS) # negative.binomial
-library(boot) # GLM CV
-library(mgcv) # GAM
-library(pscl) # zeroinfl
-library(gbm)  # GBM
+library(MASS)
+library(boot)
+library(mgcv)
+library(pscl)
+library(gbm)
 
 library(ggplot2)
 library(dplyr)
 library(tidyr)
-#library(countreg)
+library(countreg)
 
-library(rpart) # Tree and RF
+library(rpart)
 library(rpart.plot)
 
 library(glmnet)
 library(caret)
 library(jtools)
 
+library(rfCountData) # From https://github.com/fpechon/rfCountData
 ```
 
-### Conversion into factors 
+# Retrieve and format the two datasets
 
 ```{r}
 base_test <- read.table("./data/DBtest.csv", sep=",", header=TRUE)
@@ -43,13 +47,6 @@ base_train = within(base_train, {
   Power = factor(Power, labels=c("Low", "Normal", "Intermediate", "High"))
   Contract = factor(Contract,  labels=c("Basic", "Intermediate", "Full"))
   Fract = factor(Fract, labels=c("Monthly", "Quarterly", "Yearly"))
-  #Hasclaim = factor(base_train$Nbclaims > 0, labels=c("No", "Yes"))
-  
-})
-
-base_train_ordered = within(base_train, {
-  Power = factor(Power, labels=c("Low", "Normal", "Intermediate", "High"), ordered = T)
-  Contract = factor(Contract,  labels=c("Basic", "Intermediate", "Full"), ordered = T)
 })
 
 base_test = within(base_test, {
@@ -60,60 +57,78 @@ base_test = within(base_test, {
   Power = factor(Power, labels=c("Low", "Normal", "Intermediate", "High"))
   Contract = factor(Contract, labels=c("Basic", "Intermediate", "Full"))
   Fract = factor(Fract, labels=c("Monthly", "Quarterly", "Yearly"))
-  
 })
 
-base_test_ordered = within(base_test, {
-  Power = factor(Power, labels=c("Low", "Normal", "Intermediate", "High"), ordered = T)
-  Contract = factor(Contract,  labels=c("Basic", "Intermediate", "Full"), ordered = T)
-})
-
+# As there isn't any Exposure equal to zero, we can compute the real frequencies
 base_train_freq = base_train
 base_train_freq$Frequency = base_train$Nbclaims / base_train$Exposure
-
-base_train_nonull = base_train[base_train$Nbclaims > 0,]
-
 ```
 
-
+# Transform continous variables to factor using kmeans 
 ```{r}
-# Custom breaks for GLM. We'll use GAM later.
-glm_train = base_train
-glm_test = base_test
 
-glm_break_driver = c(18,25,35,50,65,80,100) # 6
-glm_break_car = c(0,3,6,9,12,15,20) # 6
+# Use this to find the number of clusters
+# kmean_withinss = function(k) {
+#    cluster = kmeans(base_train$CarAge, k) # or DriverAge
+#    return (cluster$tot.withinss)
+# }
+# max_k = 15
+# wss = sapply(2:15, kmean_withinss) # then plot
 
-glm_train$DriverAge <- cut(glm_train$DriverAge, breaks = glm_break_driver, right=F)
-glm_test$DriverAge <- cut(glm_test$DriverAge, breaks = glm_break_driver, right=F)
-glm_train$CarAge <- cut(glm_train$CarAge, breaks = glm_break_car, right = F)
-glm_test$CarAge <- cut(glm_test$CarAge, breaks = glm_break_car, right = F)
+
+# Use the mean of 50 centers to "cancel" variations
+bootKMeans = (function(k1=6, k2=8){
+  carMeans = matrix(NA, 50, k1)
+  driverMeans = matrix(NA, 50, k2)
+  
+  for (i in 1:50){
+    driverMeans[i, ] = sort(kmeans(base_train$DriverAge, k2)$centers)
+    carMeans[i, ] = sort(kmeans(base_train$CarAge, k1)$centers)
+  }
+  
+  return (
+    c(colMeans(driverMeans),colMeans(carMeans))
+  )
+})()
+
+driver_centers = bootKMeans[1:8]
+car_centers = bootKMeans[9:12]
+
+glm_train = within(base_train, {
+  DriverAge = factor(kmeans(base_train$DriverAge, driver_centers)$cluster)
+  CarAge = factor(kmeans(base_train$CarAge, car_centers)$cluster)
+})
+
+glm_test = within(base_test, {
+  DriverAge = factor(kmeans(base_test$DriverAge, driver_centers)$cluster)
+  CarAge = factor(kmeans(base_test$CarAge, car_centers)$cluster)
+})
 ```
 
+# Declare formulas
+
 ```{r}
-# ---
 formule.covariates = c("Gender", "DriverAge", "CarAge", "Area", "Leasing", "Power", "Fract", "Contract")
 
-formule.long.offset = as.formula(paste("Nbclaims ~ offset(log(Exposure)) + ", paste(formule.covariates, collapse=" + ")))
-
 formule.long = as.formula(paste("Nbclaims ~ ", paste(formule.covariates, collapse=" + ")))
-
-formule.step = as.formula(Nbclaims ~ Gender + DriverAge + Area + Leasing + 
-    Power + Fract + offset(log(Exposure)))
-
-customDeviance = function(fitt){
-  y = base_train_freq$Frequency
-  w = base_train$Exposure
-  
-  left = y * log(y) - y * log(fitt)
-  right = y - fitt
-  
-  left[y==0] = 0 # Replace NA's by 0 because log(0) is -Inf but 0*Inf ~ 0
-  
-  return(2*sum(w*(left-right)))
-}
-
+formule.long.offset = as.formula(
+  paste("Nbclaims ~ offset(log(Exposure)) + ", paste(formule.covariates, collapse=" + "))
+)
 ```
+
+# Define our Deviance function 
+
+```{r}
+cost_deviance = function(y, fitt){
+  left = y * log(y) - y * log(fitt)
+  right = -y + fitt
+  # Replace NA's by 0
+  left[y==0] = 0 
+  return(2*sum(left+right))
+}
+```
+
+# Custom function to compare models faster
 
 ```{r}
 models.comparison = data.frame()
@@ -123,15 +138,9 @@ addComparison = function(model, model_name){
       LogLik = logLik(model)[1],
       AIC = AIC(model),
       BIC = BIC(model),
-      #Deviance = deviance(model)|0,
-      Deviance.custom = customDeviance(model$fitted),
-      #Percent.of.zero = round(mean(exp(-exp(predict(model))))*100,2),
-      #Range.Predict = range(exp(predict(model))),
-      Count.0 = round(sum(dpois(0, model$fitted))),
-      Count.1 = round(sum(dpois(1, model$fitted))),
-      Count.2 = round(sum(dpois(2, model$fitted))),
-      Count.3 = round(sum(dpois(3, model$fitted))),
-      Count.4 = round(sum(dpois(4, model$fitted))),
+      #Deviance = deviance(model),
+      Deviance.custom = cost_deviance(base_train_freq$Frequency, model$fitted),
+      # Percent.of.zero = round(mean(exp(-exp(predict(model))))*100,2),
       row.names = as.character(model_name)
   )
   rbind(
@@ -141,33 +150,31 @@ addComparison = function(model, model_name){
 }
 ```
 
-### GLM Prediction
+### Generalized Linear Models
 
 ```{r}
-model.glm.1 = glm(formule.long.offset, data = base_train, family=quasipoisson(link = "log"))
-model.glm.2 = glm(formule.long.offset, data = base_train, family="poisson")
+# Naive
+model.glm.poisson.1 = glm(formule.long.offset, data = base_train, family="poisson")
+model.glm.poisson.2 = glm(formule.long.offset, data = glm_train, family="poisson") 
 
-model.glm.3 = glm(formule.short.offset, data = base_train, family="poisson")
-model.glm.4 = glm(formule.step, data = glm_train, family="poisson")
+# Now we we glm_train
+# Quasipoisson
+model.glm.quasi.1 = glm(formule.long.offset, data = glm_train, family="quasipoisson")
 
-model.glm.3 = glm(formule.long, data = glm_train, family="poisson", offset = log(Exposure))
+# Negative-binomial
+model.glm.nb.1 = glm(formule.long.offset, data = glm_train, family=negative.binomial(1))
+model.glm.nb.2 = glm(formule.long.offset, data = glm_train, family=negative.binomial(4791))
+model.glm.nb.3 = glm.nb(formule.long, data = glm_train)
 
-model.nb.1 = glm.nb(formule.long.offset, data = base_train, control = glm.control(trace = 2, maxit = 100))
-model.nb.2= glm.nb(formule.long, data = base_train, control = glm.control(trace = 2, maxit = 100))
+# Zero-Inflated
+model.glm.zero.1 = zeroinfl(formule.long, data=glm_train, dist="poisson", offset=log(Exposure))
+model.glm.zero.2 = zeroinfl(formule.long, data=glm_train, dist="negbin", offset=log(Exposure))
 
-model.zero.1 = zeroinfl(formule.long.offset, data=base_train, dist="negbin")
-model.zero.2 = zeroinfl(formule.long, data=glm_train, dist="negbin", offset = log(Exposure))
+# Hurdle
+model.glm.hurdle.1 = hurdle(formule.long.offset, data=glm_train, dist="negbin", zero.dist = "poisson")
+model.glm.hurdle.2 = hurdle(formule.long.offset, data=glm_train, dist="negbin", zero.dist = "binomial")
 
-model.hurdle.1 = hurdle(formule.long.offset, data=base_train, dist="negbin", zero.dist = "poisson")
-model.hurdle.2 = hurdle(formule.long.offset, data=base_train, dist="negbin", zero.dist = "binomial")
-
-# Hurdle with negbin is better!!
-
-```
-
-```{r}
-# Bagging GLM
-
+# Bagging 
 model.glm.bagging = (function(B = 50){
   
   nr = nrow(base_train)
@@ -178,50 +185,56 @@ model.glm.bagging = (function(B = 50){
   for (i in 1:B){
     
     samplePick = sample(nr, nr, T)
-    sampleTrain = base_train[samplePick,]
+    sampleTrain = glm_train[samplePick,]
     
-    sampleModel = glm(formule.long.offset, data = base_train, family="poisson")
+    sampleModel = glm(formule.long.offset, data = sampleTrain, family="poisson")
     
     allPredicted[i, ] = predict(sampleModel, base_test, type="response")
-    
   }
-  
   return (colMeans(allPredicted))
-  
 })()
-```
+
+# Tweedie
+
+model.glm.tweedie.1 = glm(formule.long, data=base_train, family=tweedie(var.power=1, link.power = 0), offset = log(Exposure))
+model.glm.tweedie.2 = glm(formule.long, data=glm_train, family=tweedie(var.power=1, link.power = 0), offset = log(Exposure))
+
+# Mixed poisson with random
 
 
-#### Comparison of the glm models.
+# Add to comparison
 
-```{r}
-models.comparison = addComparison(model.glm.1, "GLM 1")
-models.comparison = addComparison(model.glm.2, "GLM 2")
-models.comparison = addComparison(model.glm.3, "GLM 3")
-models.comparison = addComparison(model.glm.4, "GLM 4")
-models.comparison = addComparison(model.zero.1, "GLM Z 1")
-models.comparison = addComparison(model.hurdle.1, "GLM H 1")
-models.comparison = addComparison(model.hurdle.2, "GLM HNB 1")
-models.comparison = addComparison(model.nb.1, "GLM NB 1")
-models.comparison = addComparison(model.nb.2, "GLM NB 2")
+models.comparison = addComparison(model.glm.poisson.1, "Poisson 1")
+models.comparison = addComparison(model.glm.poisson.2, "Poisson 2")
+
+models.comparison = addComparison(model.glm.quasi.1, "Quasipoisson")
+
+models.comparison = addComparison(model.glm.nb.1, "NB 1")
+models.comparison = addComparison(model.glm.nb.2, "NB 4791")
+
+models.comparison = addComparison(model.glm.zero.1, "Zero poisson")
+models.comparison = addComparison(model.glm.zero.2, "Zero negbin")
+
+models.comparison = addComparison(model.glm.tweedie.1, "Tweedie 1")
+models.comparison = addComparison(model.glm.tweedie.2, "Tweedie 2")
+
 ```
 
 #### Cross validation (by deviance)
 
 ```{r}
 # https://stackoverflow.com/questions/44706961/output-of-cv-glm-vs-cv-glmnet
-cost_deviance <- function(y, eta) {
+cost_deviance_overflow <- function(y, eta) {
   deveta = y * log(eta) - eta
   devy = y * log(y) - y
   devy[y == 0] = 0
   sum(2 * (devy - deveta))
 }
 
-
 model.glm.1.cv = cv.glm(base_train, model.glm.1, cost_deviance, K=10)$delta
-model.glm.2.cv = cv.glm(glm_train, model.glm.2, cost_deviance, K=10)$delta
+model.glm.2.cv = cv.glm(base_train, model.glm.2, cost_deviance, K=10)
 model.glm.3.cv = cv.glm(glm_train, model.glm.3, cost_deviance, K=10)$delta
-model.glm.4.cv = cv.glm(base_train, model.glm.4, cost_deviance, K=10)$delta
+model.glm.4.cv = cv.glm(glm_train, model.glm.4, cost_deviance, K=10)$delta
 
 models.glm.cv = data.frame(model.glm.1.cv, model.glm.2.cv, model.glm.3.cv, model.glm.4.cv)
 ```

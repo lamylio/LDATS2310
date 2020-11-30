@@ -1,0 +1,532 @@
+---
+title: "Main"
+author: "Lamy Lionel"
+date: "10/11/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load all the libraries in one-shot
+
+```{r message=F, warning=F}
+set.seed(112020)
+library(MASS)
+library(boot)
+library(mgcv)
+library(pscl)
+library(gbm)
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(countreg)
+
+library(rpart)
+library(rpart.plot)
+
+library(glmnet)
+library(caret)
+library(jtools)
+
+library(rfCountData) # From https://github.com/fpechon/rfCountData
+library(lme4)
+```
+
+# Retrieve and format the two datasets
+
+```{r}
+base_test <- read.table("./data/DBtest.csv", sep=",", header=TRUE)
+base_train = read.table("./data/DBtrain.csv", sep=",", header=TRUE)
+
+base_train = within(base_train, {
+  X = NULL
+  Gender = factor(Gender, labels=c("M", "F"))
+  Area = factor(Area, labels=c("Suburban", "Urban", "Countryside low", "Coutryside high"))
+  Leasing = factor(Leasing, labels=c("Yes", "No"))
+  Power = factor(Power, labels=c("Low", "Normal", "Intermediate", "High"))
+  Contract = factor(Contract,  labels=c("Basic", "Intermediate", "Full"))
+  Fract = factor(Fract, labels=c("Monthly", "Quarterly", "Yearly"))
+})
+
+base_test = within(base_test, {
+  X = NULL
+  Gender = factor(Gender, labels=c("M", "F"))
+  Area = factor(Area, labels=c("Suburban", "Urban", "Countryside low", "Coutryside high"))
+  Leasing = factor(Leasing, labels=c("Yes", "No"))
+  Power = factor(Power, labels=c("Low", "Normal", "Intermediate", "High"))
+  Contract = factor(Contract, labels=c("Basic", "Intermediate", "Full"))
+  Fract = factor(Fract, labels=c("Monthly", "Quarterly", "Yearly"))
+})
+
+# As there isn't any Exposure equal to zero, we can compute the real frequencies
+base_train_freq = base_train
+base_train_freq$Frequency = base_train$Nbclaims / base_train$Exposure
+```
+
+# Transform continous variables to factor using kmeans 
+```{r}
+
+# Use this to find the number of clusters
+# kmean_withinss = function(k) {
+#    cluster = kmeans(base_train$CarAge, k) # or DriverAge
+#    return (cluster$tot.withinss)
+# }
+# max_k = 15
+# wss = sapply(2:15, kmean_withinss) # then plot
+
+
+# Use the mean of 50 centers to "cancel" variations
+bootKMeans = (function(k1=6, k2=8){
+  carMeans = matrix(NA, 50, k1)
+  driverMeans = matrix(NA, 50, k2)
+  
+  for (i in 1:50){
+    driverMeans[i, ] = sort(kmeans(base_train$DriverAge, k2)$centers)
+    carMeans[i, ] = sort(kmeans(base_train$CarAge, k1)$centers)
+  }
+  
+  return (
+    c(colMeans(driverMeans),colMeans(carMeans))
+  )
+})()
+
+driver_centers = bootKMeans[1:8]
+car_centers = bootKMeans[9:12]
+
+glm_train = within(base_train, {
+  DriverAge = factor(kmeans(base_train$DriverAge, driver_centers)$cluster)
+  CarAge = factor(kmeans(base_train$CarAge, car_centers)$cluster)
+})
+
+glm_test = within(base_test, {
+  DriverAge = factor(kmeans(base_test$DriverAge, driver_centers)$cluster)
+  CarAge = factor(kmeans(base_test$CarAge, car_centers)$cluster)
+})
+```
+
+# Declare formulas
+
+```{r}
+formule.covariates = c("Gender", "DriverAge", "CarAge", "Area", "Leasing", "Power", "Fract", "Contract")
+
+formule.long = as.formula(paste("Nbclaims ~ ", paste(formule.covariates, collapse=" + ")))
+
+formule.short = as.formula("Nbclaims ~ Gender + DriverAge + Area + Leasing + Power + Fract + Contract")
+formule.long.offset = as.formula(
+  paste("Nbclaims ~ offset(log(Exposure)) + ", paste(formule.covariates, collapse=" + "))
+)
+```
+
+# Define our Deviance function 
+
+```{r}
+cost_deviance = function(y, fitt){
+  left = y * log(y) - y * log(fitt)
+  right = -y + fitt
+  # Replace NA's by 0
+  left[y==0] = 0 
+  return(2*sum(left+right))
+}
+```
+
+# Custom function to compare models faster
+
+```{r}
+models.comparison = data.frame()
+
+addComparison = function(model, model_name){
+  to_combine = data.frame(
+      #LogLik = ifelse(is.null(logLik(model)[1]), yes=NA, no=logLik(model)[1]),
+      AIC = AIC(model),
+      BIC = BIC(model),
+      Deviance = ifelse(is.null(deviance(model)), yes=NA, no=deviance(model)),
+      Deviance.custom = cost_deviance(base_train_freq$Frequency, model$fitted),
+      # Percent.of.zero = round(mean(exp(-exp(predict(model))))*100,2),
+      row.names = as.character(model_name)
+  )
+  rbind(
+    models.comparison,
+    to_combine
+  )
+}
+```
+
+# Generalized Linear Models
+## In the paper I only talked about naive but have experimented many more models
+
+```{r}
+# Naive
+model.glm.poisson.1 = glm(formule.long.offset, data = base_train, family="poisson")
+model.glm.poisson.2 = glm(formule.long.offset, data = glm_train, family="poisson") 
+model.glm.poisson.3 = glm(formule.short, data = glm_train, family="poisson", offset=log(Exposure)) 
+
+# Now we we glm_train
+# Quasipoisson
+model.glm.quasi.1 = glm(formule.long.offset, data = glm_train, family="quasipoisson")
+
+# Negative-binomial
+model.glm.nb.1 = glm(formule.long.offset, data = glm_train, family=negative.binomial(1))
+model.glm.nb.2 = glm(formule.long.offset, data = glm_train, family=negative.binomial(4791))
+
+# Zero-Inflated
+model.glm.zero.1 = zeroinfl(formule.short, data=glm_train, dist="poisson", offset=log(Exposure), model = T)
+
+# Hurdle
+model.glm.hurdle.1 = hurdle(formule.long.offset, data=glm_train, dist="poisson", zero.dist = "binomial")
+model.glm.hurdle.2 = hurdle(formule.long.offset, data=glm_train, dist="negbin", zero.dist = "binomial")
+
+# Bagging 
+model.glm.bagging = (function(B = 50){
+  
+  nr = nrow(base_train)
+  nrTest = nrow(base_test)
+  
+  allPredicted = matrix(NA, B, nrTest)
+  
+  for (i in 1:B){
+    
+    samplePick = sample(nr, nr, T)
+    sampleTrain = glm_train[samplePick,]
+    
+    sampleModel = glm(formule.long.offset, data = sampleTrain, family="poisson")
+    
+    allPredicted[i, ] = predict(sampleModel, base_test, type="response")
+  }
+  return (colMeans(allPredicted))
+})()
+
+# Tweedie
+
+# tweedie.profile() results in best var.power = 1
+model.glm.tweedie.1 = glm(formule.long, data=glm_train, family=tweedie(var.power=1, link.power = 0), offset = log(Exposure))
+
+# Mixed poisson with random # Not done
+# model.glm.mixed.1 = glmer(formule.long.offset + 1|??, family = poisson, data=glm_train, nAGQ = 9)
+
+# Add to comparison
+
+models.comparison = addComparison(model.glm.poisson.1, "Poisson 1")
+models.comparison = addComparison(model.glm.poisson.2, "Poisson 2")
+models.comparison = addComparison(model.glm.poisson.3, "Poisson 3")
+
+models.comparison = addComparison(model.glm.quasi.1, "Quasipoisson")
+
+models.comparison = addComparison(model.glm.nb.1, "NB 1")
+models.comparison = addComparison(model.glm.nb.2, "NB 4791")
+
+models.comparison = addComparison(model.glm.zero.1, "Zero poisson")
+models.comparison = addComparison(model.glm.zero.2, "Zero negbin")
+
+models.comparison = addComparison(model.glm.tweedie.1, "Tweedie 1")
+
+```
+
+# Cross validation
+
+```{r}
+# https://stackoverflow.com/questions/44706961/output-of-cv-glm-vs-cv-glmnet
+# Output are the same as our cost_deviance
+# cost_deviance_overflow <- function(y, eta) {
+#   deveta = y * log(eta) - eta
+#   devy = y * log(y) - y
+#   devy[y == 0] = 0
+#   sum(2 * (devy - deveta))
+# }
+
+# 10 Folds validation
+
+# model.glm.1.cv = cv.glm(base_train, model.glm.poisson.1, K=20)
+# model.glm.2.cv = cv.glm(glm_train, model.glm.poisson.2, cost_deviance_overflow, K=10)$delta
+
+# Using glmnet
+library(glmnet)
+glm_x = data.frame(glm_train$Gender, glm_train$DriverAge, glm_train$CarAge, glm_train$Area, glm_train$Leasing, glm_train$Power, glm_train$Fract, glm_train$Contract)
+
+# model.glm.net = glmnet(glm_x_matrix, glm_train$Nbclaims, data=glm_train, offset=log(glm_train$Exposure), family = "poisson")
+
+model.glm.net.cv = cv.glmnet(glm_x_matrix, glm_train$Nbclaims, data=glm_train, offset=log(glm_train$Exposure), family = "poisson", type.measure = "deviance")
+
+```
+
+# GAM
+
+```{r}
+
+model.gam.1 = gam(
+    Nbclaims ~ s(DriverAge, bs ="cr", k=5) + s(CarAge,bs ="cr", k= 3) + Power+Gender+Area+Leasing+Fract,
+    data = base_train, 
+    family=poisson(link = "log"),
+    offset = log(Exposure),
+    method = "ML"
+)
+
+model.gam.1.predicted = predict(model.gam.1, type="response")
+# model.gam.2.predicted = predict(model.gam.2, type="response")
+# model.gam.3.predicted = predict(model.gam.3, type="response")
+# model.gam.4.predicted = predict(model.gam.4, type="response")
+
+
+plot(model.gam.1, rug = T, se = T, shade = T, shade.col = 'gray90')
+
+models.comparison = addComparison(model.gam.1, "GAM 1")
+# models.comparison = addComparison(model.gam.2, "GAM 2")
+# models.comparison = addComparison(model.gam.3, "GAM 3")
+# models.comparison = addComparison(model.gam.4, "GAM 3")
+```
+
+# Regression tree (RT)
+
+```{r}
+model.tree.1 = rpart(
+  cbind(Exposure, Nbclaims) ~ Gender + DriverAge + CarAge + Power + Area + Fract + Leasing, 
+  data=base_train,
+  method = "poisson",
+  control = rpart.control(xval = 10)
+)
+
+model.tree.2 = rpart(
+  cbind(Exposure, Nbclaims) ~ Gender + DriverAge + CarAge + Power + Area + Fract + Leasing, 
+  data=base_train,
+  method = "poisson",
+  control = rpart.control(cp=0.001, xval = 10)
+)
+
+
+model.tree.3 = rpart(
+  cbind(Exposure, Nbclaims) ~ Gender + DriverAge + CarAge + Power + Area + Fract + Leasing, 
+  data=base_train,
+  method = "poisson",
+  control = rpart.control(cp=0.0005, xval = 10)
+)
+
+rpart.plot(model.tree.1, digits=2, type=4)
+
+model.tree.3.predicted = exp(predict(model.tree.1, base_test))
+
+# Bagging
+model.tree.4.predicted = (function(M = 20){
+  nr = nrow(base_train) # size of the dataset
+  nrTest = nrow(base_test)
+  
+  allPredict = matrix(0, M, nrTest)
+  
+  for (i in 1:M){
+    
+    samplePick = sample(nr, nr, T)
+    sampleTrain = base_train[samplePick,]
+    
+    sampleTree = rpart(
+        cbind(Exposure, Nbclaims) ~ Gender + DriverAge + CarAge + Power + Area + Fract + Leasing, 
+    data=base_train,
+    method = "poisson",
+    control = rpart.control(cp=0.0005, xval = 10)
+    )
+    allPredict[i,] = predict(sampleTree, base_test)
+  }
+  
+  return (colMeans(allPredict))
+})()
+```
+
+# Random Forest
+# As in the examples given
+```{r}
+
+model.forest.1 = (function(M=100, C=3){
+  # C is number of covariates picked
+  nr = nrow(base_train)
+  nrTest = nrow(base_test)
+  sampleSize = nr
+  
+  
+  allResults = matrix(NA, M, nrTest)
+  for (i in 1:M){
+    
+    trainSample = sample(nr, sampleSize, replace=T)
+    trainSample = base_train[trainSample,]
+    
+    covSample = sample(formule.covariates, C)
+    equation = paste("cbind(Exposure, Nbclaims) ~ ", paste(covSample, collapse = " + "))
+    
+    tree = rpart(equation, data=trainSample, method="poisson", control=rpart.control(cp=0.0005, xval = 10))
+    allResults[i,] = predict(tree, base_test)
+  }
+  
+  return (colMeans(allResults))
+})()
+
+# This one is parametric (poisson)
+model.forest.2 = (function(M=100, C=3){
+  # C is number of covariates picked
+  
+  baseTree = model.tree.3 # See above
+  
+  nr = nrow(base_train)
+  nrTest = nrow(base_test)
+  sampleSize = nr
+  
+  
+  allResults = matrix(NA, M, nrTest)
+  for (i in 1:M){
+    
+    baseFit = predict(baseTree, base_train)
+    baseFitNbclaims = rpois(nr, baseFit*base_train$Exposure)
+    
+    trainSample = base_train
+    trainSample$Nbclaims = baseFitNbclaims # Replace by predicted
+    
+    covSample = sample(formule.covariates, C)
+    equation = paste("cbind(Exposure, Nbclaims) ~ ", paste(covSample, collapse = " + "))
+    
+    tree = rpart(equation, data=trainSample, method="poisson", control=rpart.control(cp=0.0005, xval = 10))
+    allResults[i,] = predict(tree, base_test_ordered)
+  }
+  
+  return (colMeans(allResults))
+})()
+```
+
+# Random Forest with rfCountData from github
+
+```{r}
+rfPoisson_train = within(neural_train, {
+    
+  Nbclaims = NULL
+  Exposure = NULL
+  Frequency = NULL
+  
+})
+nr      = nrow(rfPoisson_train)
+sizecal = round(0.80*nr)
+
+tmp     =sample( nr, sizecal , replace = FALSE, prob = NULL)
+rfPoisson_calib = rfPoisson_train[tmp,]
+rfPoisson_valid = rfPoisson_train[-tmp,]
+
+model.rfCount = rfPoisson(x = rfPoisson_train, y=base_train$Nbclaims, offset = log(base_train$Exposure), ntree=300, do.trace=T, replace = T, sampsize = 0.85*70000)
+
+model.rfCount.cv = rfcv(trainx = rfPoisson_calib, trainy = base_train[tmp,]$Nbclaims, offset(log(base_train[tmp,]$Exposure)))
+
+plot(model.rfCount)
+```
+
+
+
+# Gradient boosting model
+
+```{r}
+model.gbm.1 = gbm(formule.long.offset, data=base_train, distribution = "poisson", shrinkage = 0.001, n.trees = 5000, n.cores = 4, cv.folds = 3, train.fraction = 0.75, weights = model.glm.poisson.2$fitted)
+
+model.gbm.2 = gbm(formule.long.offset, data=base_train, distribution = "poisson", shrinkage = 0.001, n.trees = 5000, n.cores = 4, cv.folds = 3, train.fraction = 0.75) # without weights 
+
+gbm.best.oob = gbm.perf(model.gbm.2, method = "OOB")
+gbm.best.cv = gbm.perf(model.gbm.2, method = "cv")
+gbm.best.test = gbm.perf(model.gbm.2, method = "test")
+
+par(mfrow=c(2,2))
+plot(model.gbm.2, i.var = 1)
+plot(model.gbm.2, i.var = 2)
+plot(model.gbm.2, i.var = 3)
+plot(model.gbm.2, i.var = 4)
+
+install.packages('dismo')
+library(dismo)
+brtTuning<- gbm.step(data=base_train,
+   gbm.x = 1:8,
+   gbm.y = 10,
+   family = "poisson",
+   tree.complexity = 4,
+   learning.rate = 0.001,
+   bag.fraction = 0.75)
+
+```
+
+# Neural Network
+
+```{r}
+#library(neuralnet)
+
+# public neuralnet has not the err.fct = "poisson"
+source(file="./NN/DHneuralnetDeviance.r")
+source(file="./NN/DHplot.nn.r")
+source(file="./NN/DHcompute.r")
+source(file="./NN/DHgwplot.r")
+
+
+# Scale the cat.var
+scaled_driver = (base_train$DriverAge-min(base_train$DriverAge))/(max(base_train$DriverAge)-min(base_train$DriverAge))
+scaled_car = (base_train$CarAge-min(base_train$CarAge))/(max(base_train$CarAge)-min(base_train$CarAge))
+
+neural_dummies = model.matrix(~ Gender+Power+Area+Fract+Leasing+Contract, data=base_train)[,-1]
+
+neural_train = data.frame(DriverAge=scaled_driver, CarAge=scaled_car, neural_dummies, Nbclaims=base_train$Nbclaims, Exposure=base_train_freq$Exposure, Frequency=base_train_freq$Frequency)
+
+# Split the data to control overfitting
+
+nr      = nrow(neural_train)
+sizecal = round(0.80*nr)
+
+tmp     =sample( nr, sizecal , replace = FALSE, prob = NULL)
+neural_calib = neural_train[tmp,]
+neural_valid = neural_train[-tmp,]
+
+formule.neural = as.formula(paste0("Frequency ~ ", paste(colnames(neural_train)[1:14], collapse = " + ")))
+
+model.neural.1 = neuralnet(formule.neural, data=neural_train, hidden=5, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson")
+
+# Get covariates easily
+covariates.neural = function(base){
+  cov = NULL
+  for (co in colnames(neural_train)[1:14]){
+    if (is.null(cov)){
+      cov = base[co]
+    }else{
+      cov = cbind(cov, base[co])
+    }
+  }
+  return (cov)
+}
+
+
+neural.calib.1 = neuralnet(formule.neural, data=neural_calib, hidden=1, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep = 5)
+neural.calib.2 = neuralnet(formule.neural, data=neural_calib, hidden=2, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep = 5)
+neural.calib.3 = neuralnet(formule.neural, data=neural_calib, hidden=3, threshold=1, lifesign = "full",lifesign.step = 100,err.fct="poisson", rep = 5)
+
+model.neural.calib = c(
+  neural.calib.1$result.matrix[1],
+  neural.calib.2$result.matrix[1],
+  neural.calib.3$result.matrix[1]
+)
+
+neural.valid.1 = compute(neural.calib.1, covariates.neural(neural_valid), 50, neural_valid$Frequency, neural_valid$Exposure) 
+
+neural.valid.2 = compute(neural.calib.2, covariates.neural(neural_valid), 50, neural_valid$Frequency, neural_valid$Exposure) 
+
+neural.valid.3 = compute(neural.calib.3, covariates.neural(neural_valid), 50, neural_valid$Frequency, neural_valid$Exposure)
+
+
+model.neural.valid = c(
+  neural.valid.1$devstat,
+  neural.valid.2$devstat,
+  neural.valid.3$devstat
+)
+
+ggplot() + aes(x=3:6)+ geom_line(aes(y=model.neural.valid, col="red"))
+
+```
+
+
+# --- END ---
+
+# MOB Random forest
+
+```{r}
+library(mobForest)
+
+
+model.mob = mobforest.analysis(formule.long.offset, data=base_train, family = poisson(), partition_vars = formule.covariates)
+
+```

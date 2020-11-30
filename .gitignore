@@ -6,3 +6,4 @@ Projet.Rproj
 *.Rproj.*
 
 .Rproj.user/*
+.Rproj.user
